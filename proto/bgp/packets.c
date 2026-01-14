@@ -1401,7 +1401,9 @@ bgp_encode_next_hop_ip(struct bgp_write_state *s, eattr *a, byte *buf, uint size
    * IPv6 address with IPv6 NLRI.
    */
 
-  if (bgp_channel_is_ipv4(s->ptx->c) && ipa_is_ip4(nh[0]))
+  /* In BMP mode, ptx->c is NULL, use desc->afi to check for IPv4 */
+  int is_ipv4 = s->ptx->c ? bgp_channel_is_ipv4(s->ptx->c) : (s->desc && s->desc->afi == BGP_AF_IPV4);
+  if (is_ipv4 && ipa_is_ip4(nh[0]))
   {
     put_ip4(buf, ipa_to_ip4(nh[0]));
     return 4;
@@ -2359,13 +2361,17 @@ bgp_get_af_desc(u32 afi)
 static inline uint
 bgp_encode_nlri(struct bgp_write_state *s, struct bgp_bucket *buck, byte *buf, byte *end)
 {
-  return s->ptx->c->desc->encode_nlri(s, buck, buf, end - buf);
+  /* In BMP mode, ptx->c is NULL, use s->desc instead */
+  const struct bgp_af_desc *desc = s->ptx->c ? s->ptx->c->desc : s->desc;
+  return desc->encode_nlri(s, buck, buf, end - buf);
 }
 
 static inline uint
 bgp_encode_next_hop(struct bgp_write_state *s, eattr *nh, byte *buf)
 {
-  return s->ptx->c->desc->encode_next_hop(s, nh, buf, 255);
+  /* In BMP mode, ptx->c is NULL, use s->desc instead */
+  const struct bgp_af_desc *desc = s->ptx->c ? s->ptx->c->desc : s->desc;
+  return desc->encode_next_hop(s, nh, buf, 255);
 }
 
 void
@@ -2387,11 +2393,15 @@ bgp_create_ip_reach(struct bgp_write_state *s, struct bgp_bucket *buck, byte *bu
    *	var	IPv4 Network Layer Reachability Information
    */
 
-  ASSERT_DIE(s->ptx->withdraw_bucket != buck);
+  ASSERT_DIE((s->ptx->bmp) || (s->ptx->withdraw_bucket != buck));
 
   int lr, la;
 
-  la = bgp_encode_attrs(s, buck->eattrs, buf+4, buf + MAX_ATTRS_LENGTH);
+  /* In BMP mode, use stable eattrs from write_state instead of bucket */
+  ea_list *eattrs = s->bmp_eattrs ? s->bmp_eattrs : buck->eattrs;
+
+  la = bgp_encode_attrs(s, eattrs, buf+4, buf + MAX_ATTRS_LENGTH);
+
   if (la < 0)
   {
     /* Attribute list too long */
@@ -2436,12 +2446,16 @@ bgp_create_mp_reach(struct bgp_write_state *s, struct bgp_bucket *buck, byte *bu
   buf[4] = BAF_OPTIONAL | BAF_EXT_LEN;
   buf[5] = BA_MP_REACH_NLRI;
   put_u16(buf+6, 0);		/* Will be fixed later */
-  put_af3(buf+8, s->ptx->c->afi);
+  /* In BMP mode, ptx->c is NULL, use s->desc->afi instead */
+  u32 afi = s->ptx->c ? s->ptx->c->afi : s->desc->afi;
+  put_af3(buf+8, afi);
   byte *pos = buf+11;
 
   /* Encode attributes to temporary buffer */
+  /* In BMP mode, use stable eattrs from write_state instead of bucket */
+  ea_list *eattrs = s->bmp_eattrs ? s->bmp_eattrs : buck->eattrs;
   byte *abuf = alloca(MAX_ATTRS_LENGTH);
-  la = bgp_encode_attrs(s, buck->eattrs, abuf, abuf + MAX_ATTRS_LENGTH);
+  la = bgp_encode_attrs(s, eattrs, abuf, abuf + MAX_ATTRS_LENGTH);
   if (la < 0)
   {
     /* Attribute list too long */
@@ -2450,6 +2464,9 @@ bgp_create_mp_reach(struct bgp_write_state *s, struct bgp_bucket *buck, byte *bu
   }
 
   /* Encode the next hop */
+  if (!s->mp_next_hop)
+    return NULL;
+
   lh = bgp_encode_next_hop(s, s->mp_next_hop, pos+1);
   *pos = lh;
   pos += 1+lh;
@@ -2530,7 +2547,7 @@ bgp_create_mp_unreach(struct bgp_write_state *s, struct bgp_bucket *buck, byte *
 #ifdef CONFIG_BMP
 
 static byte *
-bgp_create_update_bmp(ea_list *channel_ea, byte *buf, byte *end, struct bgp_bucket *buck, bool update)
+bgp_create_update_bmp(ea_list *channel_ea, byte *buf, byte *end, struct bgp_bucket *buck, ea_list *bmp_eattrs, bool update)
 {
   byte *res = NULL;
 
@@ -2552,20 +2569,18 @@ bgp_create_update_bmp(ea_list *channel_ea, byte *buf, byte *end, struct bgp_buck
     .add_path = ea_get_int(channel_ea, &ea_bgp_add_path_rx, 0),
     .mpls = desc->mpls,
     .ignore_non_bgp_attrs = 1,
+    .desc = desc,  /* For BMP mode when ptx->c is NULL */
+    .bmp_eattrs = bmp_eattrs,  /* Stable ea_list for BMP encoding */
   };
 
   if (!update)
-  {
     res = !s.mp_reach ?
       bgp_create_ip_unreach(&s, buck, buf, end):
       bgp_create_mp_unreach(&s, buck, buf, end);
-  }
   else
-  {
     res = !s.mp_reach ?
       bgp_create_ip_reach(&s, buck, buf, end):
       bgp_create_mp_reach(&s, buck, buf, end);
-  }
 
   return res;
 }
@@ -2573,18 +2588,17 @@ bgp_create_update_bmp(ea_list *channel_ea, byte *buf, byte *end, struct bgp_buck
 byte *
 bgp_bmp_encode_rte(ea_list *c, byte *buf, byte *end, const struct rte *new)
 {
-  uint ea_size = new->attrs ? (sizeof(ea_list) + new->attrs->count * sizeof(eattr)) : 0;
-  uint prefix_size = sizeof(struct bgp_prefix) + new->net->length;
-
   struct lp_state *tmpp = lp_save(tmp_linpool);
 
-  /* Temporary bucket */
-  struct bgp_bucket *b = tmp_allocz(sizeof(struct bgp_bucket) + ea_size);
-  b->bmp = 1;
-  init_list(&b->prefixes);
+  /* Get a stable reference-counted copy of attrs - this ensures adata stays valid */
+  ea_list *stable_attrs = new->attrs ? ea_lookup(new->attrs, 0, EALS_CUSTOM) : NULL;
 
-  if (new->attrs)
-    memcpy(b->eattrs, new->attrs, ea_size);
+  uint prefix_size = sizeof(struct bgp_prefix) + new->net->length;
+
+  /* Create a minimal bucket structure - eattrs not used, we pass stable_attrs directly */
+  struct bgp_bucket bucket_storage = { .bmp = 1 };
+  struct bgp_bucket *b = &bucket_storage;
+  init_list(&b->prefixes);
 
   /* Temporary prefix */
   struct bgp_prefix *px = tmp_allocz(prefix_size);
@@ -2593,7 +2607,11 @@ bgp_bmp_encode_rte(ea_list *c, byte *buf, byte *end, const struct rte *new)
   px->ni = NET_TO_INDEX(new->net);
   add_tail(&b->prefixes, &px->buck_node);
 
-  end = bgp_create_update_bmp(c, buf, end, b, !!new->attrs);
+  end = bgp_create_update_bmp(c, buf, end, b, stable_attrs, !!new->attrs);
+
+  /* Release the reference to stable_attrs */
+  if (stable_attrs)
+    ea_free_later(stable_attrs);
 
   lp_restore(tmp_linpool, tmpp);
 

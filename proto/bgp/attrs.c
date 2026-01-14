@@ -1458,10 +1458,12 @@ static inline int
 bgp_encode_attr(struct bgp_write_state *s, eattr *a, byte *buf, uint size)
 {
   const union bgp_attr_desc *desc = bgp_find_attr_desc(a);
+
   if (s->ignore_non_bgp_attrs == 0)
     ASSERT_DIE(desc);
   else if (desc == NULL)
     return 0;
+
   return desc->encode(s, a, buf, size);
 }
 

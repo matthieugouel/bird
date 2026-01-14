@@ -599,6 +599,9 @@ struct bgp_write_state {
 
   eattr *mp_next_hop;
   const adata *mpls_labels;
+
+  const struct bgp_af_desc *desc;  /* Used in BMP mode when ptx->c is NULL */
+  ea_list *bmp_eattrs;             /* Used in BMP mode to hold stable ea_list reference */
 };
 
 struct bgp_parse_state {

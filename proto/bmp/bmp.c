@@ -625,6 +625,10 @@ bmp_add_stream(struct bmp_proto *p, struct bmp_peer *bp, struct bmp_table *bt, c
   struct bmp_stream *bs = mb_allocz(p->p.pool, sizeof(struct bmp_stream));
   bs->info = *bsi;
 
+  /* Keep channel_state alive for the lifetime of the stream */
+  if (bsi->channel_state)
+    ea_ref(bsi->channel_state);
+
   bmp_table_stream_add_tail(&bt->streams, bs);
   bmp_peer_stream_add_tail(&bp->streams, bs);
   HASH_INSERT(p->stream_map, HASH_STREAM, bs);
@@ -644,6 +648,10 @@ bmp_remove_stream(struct bmp_proto *p, struct bmp_stream *bs)
     /* If out_req.cur, then we are called from bmp_check_routes()
      * and therefore the table will be removed in the tail position there. */
     bmp_remove_table(p, bt);
+
+  /* Release channel_state reference */
+  if (bs->info.channel_state)
+    ea_free_later(bs->info.channel_state);
 
   mb_free(bs);
 }
@@ -715,7 +723,7 @@ bmp_add_peer(struct bmp_proto *p, struct bmp_peer_info *bpi, ea_list **cached_ch
     bsi.channel_name = ea_get_adata(bsi.channel_state, &ea_name)->data;
 
     struct bmp_table *bt = bmp_get_table(p, ea_get_ptr(bsi.channel_state, &ea_rtable, NULL));
- 
+
     if (p->monitoring_rib.in_pre_policy)
     {
       bsi.mode = BMP_STREAM_PRE_POLICY;
@@ -848,6 +856,12 @@ bmp_route_monitor_notify(struct bmp_proto *p, struct bmp_peer *bp, struct bmp_st
 
   ea_list *bgp = bp->info.proto_state;
   ea_list *c = bs->info.channel_state;
+
+  if (!bgp || !c)
+    return;
+
+  if (!new || !new->net || !new->src)
+    return;
 
   btime delta_t = new ? current_time() - new->lastmod : 0;
 
@@ -1024,24 +1038,33 @@ bmp_split_policy(struct bmp_proto *p, const rte *new, const rte *old)
     .proto_id = c->proto->id,
   };
   struct bmp_peer *bp = bmp_get_peer(p, &bpi);
+  if (!bp)
+    return;
+
+  /* Derive AFI from the route's net type for stream lookup.
+   * The stream hash key uses channel_id + afi + mode.
+   * BGP_AF_* values encode both AFI and SAFI: (AFI << 16) | SAFI */
+  u32 afi = (loc.net->type == NET_IP4) ? BGP_AF_IPV4 :
+            (loc.net->type == NET_IP6) ? BGP_AF_IPV6 : 0;
+  if (!afi)
+    return;
 
   struct bmp_stream_info bsi = {
     .channel_id = c->id,
+    .afi = afi,
   };
 
   /* Checking the pre policy */
   if (p->monitoring_rib.in_pre_policy)
   {
-    /* Compute the pre policy route attributes */
-    loc.attrs = new ? ea_strip_to(new->attrs, BIT32_ALL(EALS_PREIMPORT)) : NULL;
-    ea_list *old_attrs = old ? ea_strip_to(old->attrs, BIT32_ALL(EALS_PREIMPORT)) : NULL;
-
     bsi.mode = BMP_STREAM_PRE_POLICY;
     struct bmp_stream *bs = bmp_get_stream(p, &bsi);
     if (!bs)
       return;
 
-    bmp_route_monitor_notify(p, bp, bs, &loc, old_attrs);
+    /* Pass original route without attribute stripping for now.
+     * The ea_strip_to result may not be compatible with BGP encoding. */
+    bmp_route_monitor_notify(p, bp, bs, new, old ? old->attrs : NULL);
   }
 
   /* Checking the post policy */
